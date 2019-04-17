@@ -35,11 +35,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/pkg/errors"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 
-	"github.com/pkg/errors"
+	//"strconv"
 )
 
 // Client is a client for interacting with a GraphQL API.
@@ -47,6 +49,9 @@ type Client struct {
 	endpoint         string
 	httpClient       *http.Client
 	useMultipartForm bool
+
+	useMultipartRequestSpec bool
+
 
 	// closeReq will close the request body immediately allowing for reuse of client
 	closeReq bool
@@ -87,11 +92,14 @@ func (c *Client) Run(ctx context.Context, req *Request, resp interface{}) error 
 		return ctx.Err()
 	default:
 	}
-	if len(req.files) > 0 && !c.useMultipartForm {
+	if len(req.files) > 0 && !(c.useMultipartForm || c.useMultipartRequestSpec) {
 		return errors.New("cannot send files with PostFields option")
 	}
 	if c.useMultipartForm {
 		return c.runWithPostFields(ctx, req, resp)
+	}
+	if c.useMultipartRequestSpec {
+		return c.runMultipartRequestSpec(ctx, req, resp)
 	}
 	return c.runWithJSON(ctx, req, resp)
 }
@@ -110,44 +118,11 @@ func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}
 	}
 	c.logf(">> variables: %v", req.vars)
 	c.logf(">> query: %s", req.q)
-	gr := &graphResponse{
-		Data: resp,
-	}
-	r, err := http.NewRequest(http.MethodPost, c.endpoint, &requestBody)
-	if err != nil {
-		return err
-	}
-	r.Close = c.closeReq
-	r.Header.Set("Content-Type", "application/json; charset=utf-8")
-	r.Header.Set("Accept", "application/json; charset=utf-8")
-	for key, values := range req.Header {
-		for _, value := range values {
-			r.Header.Add(key, value)
-		}
-	}
-	c.logf(">> headers: %v", r.Header)
-	r = r.WithContext(ctx)
-	res, err := c.httpClient.Do(r)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, res.Body); err != nil {
-		return errors.Wrap(err, "reading body")
-	}
-	c.logf("<< %s", buf.String())
-	if err := json.NewDecoder(&buf).Decode(&gr); err != nil {
-		if res.StatusCode != http.StatusOK {
-			return fmt.Errorf("graphql: server returned a non-200 status code: %v", res.StatusCode)
-		}
-		return errors.Wrap(err, "decoding response")
-	}
-	if len(gr.Errors) > 0 {
-		// return first error
-		return gr.Errors[0]
-	}
-	return nil
+
+	req.body = requestBody
+	req.contentType = "application/json; charset=utf-8"
+
+	return c.makeRequest(ctx, req, resp)
 }
 
 func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp interface{}) error {
@@ -181,15 +156,82 @@ func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp inter
 	c.logf(">> variables: %s", variablesBuf.String())
 	c.logf(">> files: %d", len(req.files))
 	c.logf(">> query: %s", req.q)
+
+	req.body = requestBody
+	req.contentType = writer.FormDataContentType()
+
+	return c.makeRequest(ctx, req, resp)
+}
+
+func (c *Client) runMultipartRequestSpec(ctx context.Context, req *Request, resp interface{}) error {
+
+	if len(req.vars) > 0 {
+		return errors.New("variables doesn't supported due to the multipart request spec https://github.com/jaydenseric/graphql-multipart-request-spec/issues/22")
+	}
+
+	var requestBody bytes.Buffer
+	writer := multipart.NewWriter(&requestBody)
+
+	multipartRequestSpecQuery := req.fillMultipartRequestSpecQuery()
+	operations, err := json.Marshal(multipartRequestSpecQuery.Operations)
+	if err != nil {
+		return errors.Wrap(err, "marshal operations")
+	}
+	maps, err := json.Marshal(multipartRequestSpecQuery.Map)
+	if err != nil {
+		return errors.Wrap(err, "marshal map")
+	}
+
+	if err := writer.WriteField("operations", string(operations)); err != nil {
+		return errors.Wrap(err, "write operation field")
+	} else {
+		c.logf(">> field: %s = %s", "operations", string(operations))
+	}
+
+	if err := writer.WriteField("map", string(maps)); err != nil {
+		return errors.Wrap(err, "write maps field")
+	} else {
+		c.logf(">> field: %s = %s", "map", string(maps))
+	}
+
+	for i := range req.files {
+		part, err := writer.CreateFormFile(req.files[i].Field, req.files[i].Name)
+		if err != nil {
+			return errors.Wrap(err, "create form file")
+		}
+		if _, err := io.Copy(part, req.files[i].R); err != nil {
+			return errors.Wrap(err, "preparing file")
+		}
+
+		fieldName := req.files[i].Field
+		fieldValue := `@` + req.files[i].Name
+
+		if err := writer.WriteField(fieldName, fieldValue); err != nil {
+			return errors.Wrap(err, "write maps field")
+		} else {
+			c.logf(">> field: %s = %s", fieldName, fieldValue)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return errors.Wrap(err, "close writer")
+	}
+
+	req.body = requestBody
+	req.contentType = writer.FormDataContentType()
+
+	return c.makeRequest(ctx, req, resp)
+}
+
+func (c *Client) makeRequest(ctx context.Context, req *Request, resp interface{}) error {
 	gr := &graphResponse{
 		Data: resp,
 	}
-	r, err := http.NewRequest(http.MethodPost, c.endpoint, &requestBody)
+	r, err := http.NewRequest(http.MethodPost, c.endpoint, &req.body)
 	if err != nil {
 		return err
 	}
 	r.Close = c.closeReq
-	r.Header.Set("Content-Type", writer.FormDataContentType())
+	r.Header.Set("Content-Type", req.contentType)
 	r.Header.Set("Accept", "application/json; charset=utf-8")
 	for key, values := range req.Header {
 		for _, value := range values {
@@ -221,6 +263,43 @@ func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp inter
 	return nil
 }
 
+type multipartRequestSpecQuery struct {
+	Operations struct {
+		Query string `json:"query"`
+		Variables interface{} `json:"variables"`
+	} `json:"operations"`
+	Map map[string][]string `json:"map"`
+}
+
+func (req *Request) fillMultipartRequestSpecQuery() multipartRequestSpecQuery {
+
+	type Variables struct{
+		Files [] interface{} `json:"files"`
+	}
+	type VariablesEmpty struct{
+	}
+
+	query := new(multipartRequestSpecQuery)
+	variables := new(Variables)
+
+	query.Operations.Query = req.Query()
+	query.Map = make(map[string][]string)
+
+	for index, file := range req.Files() {
+		variables.Files = append(variables.Files, nil)
+
+		query.Map[file.Field] = []string{`variables.files.` + strconv.Itoa(index)}
+	}
+
+	if len(req.Files()) > 0 {
+		query.Operations.Variables = variables
+	} else {
+		query.Operations.Variables = new(VariablesEmpty)
+	}
+
+	return *query
+}
+
 // WithHTTPClient specifies the underlying http.Client to use when
 // making requests.
 //  NewClient(endpoint, WithHTTPClient(specificHTTPClient))
@@ -235,6 +314,15 @@ func WithHTTPClient(httpclient *http.Client) ClientOption {
 func UseMultipartForm() ClientOption {
 	return func(client *Client) {
 		client.useMultipartForm = true
+	}
+}
+
+// UseMultipartRequestSpec uses for files upload, implementing multipart request specification:
+// https://github.com/jaydenseric/graphql-multipart-request-spec
+// Variables doesn't supported: https://github.com/jaydenseric/graphql-multipart-request-spec/issues/22
+func UseMultipartRequestSpec() ClientOption {
+	return func(client *Client) {
+		client.useMultipartRequestSpec = true
 	}
 }
 
@@ -271,6 +359,9 @@ type Request struct {
 	// Header represent any request headers that will be set
 	// when the request is made.
 	Header http.Header
+
+	body        bytes.Buffer
+	contentType string
 }
 
 // NewRequest makes a new Request with the specified string.
