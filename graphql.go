@@ -35,13 +35,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/pkg/errors"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"strconv"
 
-	//"strconv"
+	"github.com/pkg/errors"
 )
 
 // Client is a client for interacting with a GraphQL API.
@@ -51,7 +50,6 @@ type Client struct {
 	useMultipartForm bool
 
 	useMultipartRequestSpec bool
-
 
 	// closeReq will close the request body immediately allowing for reuse of client
 	closeReq bool
