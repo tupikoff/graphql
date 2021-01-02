@@ -10,7 +10,7 @@ Low-level GraphQL client for Go.
 * Simple error handling
 
 ## Installation
-Make sure you have a working Go environment. To install graphql, simply run:
+Make sure you have a working Go environment. To install graphql, run:
 
 ```
 $ go get github.com/machinebox/graphql
